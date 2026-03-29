@@ -1,11 +1,141 @@
 """ClearML MCP Server implementation."""
 
-from typing import Any
+from typing import Any, Mapping
 
 from clearml import Model, Task
 from fastmcp import FastMCP
 
 mcp = FastMCP("clearml-mcp")
+
+VALID_SCALAR_X_AXIS = ("iter", "timestamp", "iso_time")
+
+
+def _tool_error(message: str) -> dict[str, Any]:
+    """Standard error payload for tools that use ok or error style."""
+    return {"ok": False, "error": message}
+
+
+def _truncate_xy(
+    x: list[Any],
+    y: list[Any],
+    max_points: int | None,
+) -> tuple[list[Any], list[Any]]:
+    if max_points is None or max_points <= 0 or len(y) <= max_points:
+        return x, y
+    return x[-max_points:], y[-max_points:]
+
+
+def _load_reported_scalars(
+    task: object,
+    *,
+    full_series: bool,
+    max_samples: int,
+    x_axis: str,
+) -> Mapping[str, Any]:
+    if x_axis not in VALID_SCALAR_X_AXIS:
+        msg = f"x_axis must be one of {VALID_SCALAR_X_AXIS}"
+        raise ValueError(msg)
+    if full_series:
+        return task.get_all_reported_scalars(x_axis=x_axis)
+    return task.get_reported_scalars(max_samples=max_samples, x_axis=x_axis)
+
+
+def _variant_summary_and_series(
+    data: dict[str, Any],
+    *,
+    include_series: bool,
+    max_points_per_series: int | None,
+) -> dict[str, Any]:
+    ys = data.get("y") if data and "y" in data else None
+    xs = data.get("x") if data and "x" in data else None
+    if not ys:
+        out: dict[str, Any] = {
+            "last_value": None,
+            "min_value": None,
+            "max_value": None,
+            "iterations": 0,
+        }
+        if include_series:
+            out["x"] = []
+            out["y"] = []
+        return out
+
+    out = {
+        "last_value": ys[-1],
+        "min_value": min(ys),
+        "max_value": max(ys),
+        "iterations": len(ys),
+    }
+    if include_series:
+        xi = list(xs) if xs is not None else []
+        yi = list(ys)
+        xi, yi = _truncate_xy(xi, yi, max_points_per_series)
+        out["x"] = xi
+        out["y"] = yi
+    return out
+
+
+def _metrics_from_scalars(
+    scalars: dict[str, Any],
+    *,
+    include_series: bool,
+    max_points_per_series: int | None,
+) -> dict[str, Any]:
+    metrics: dict[str, Any] = {}
+    for metric, variants in scalars.items():
+        metrics[metric] = {}
+        for variant, data in variants.items():
+            if not data or "y" not in data:
+                continue
+            metrics[metric][variant] = _variant_summary_and_series(
+                data,
+                include_series=include_series,
+                max_points_per_series=max_points_per_series,
+            )
+    return metrics
+
+
+def _merge_task_filter(
+    status: str | None,
+    page: int | None,
+    page_size: int | None,
+) -> dict[str, Any] | None:
+    task_filter: dict[str, Any] = {}
+    if status:
+        task_filter["status"] = [status]
+    if page_size is not None:
+        task_filter["page"] = page if page is not None else 0
+        task_filter["page_size"] = page_size
+        task_filter.setdefault("order_by", ["-last_update"])
+    return task_filter or None
+
+
+def _script_to_dict(script: object) -> dict[str, Any]:
+    if script is None:
+        return {}
+    keys = (
+        "repository",
+        "branch",
+        "version_num",
+        "entry_point",
+        "working_dir",
+        "diff",
+        "binary",
+        "requirements",
+    )
+    out: dict[str, Any] = {}
+    for key in keys:
+        if not hasattr(script, key):
+            continue
+        val = getattr(script, key, None)
+        if key == "requirements" and val is not None:
+            try:
+                out[key] = dict(val)
+            except (TypeError, ValueError):
+                out[key] = str(val)
+        else:
+            out[key] = val
+    return out
 
 
 def initialize_clearml_connection() -> None:
@@ -16,6 +146,19 @@ def initialize_clearml_connection() -> None:
             raise ValueError("No ClearML projects accessible - check your clearml.conf")
     except Exception as e:
         raise RuntimeError(f"Failed to initialize ClearML connection: {e!s}")
+
+
+@mcp.tool()
+async def get_connection_info() -> dict[str, Any]:
+    """Return ClearML connectivity and server side project visibility (read only)."""
+    try:
+        projects = Task.get_projects()
+        return {
+            "ok": True,
+            "accessible_project_count": len(projects),
+        }
+    except Exception as e:
+        return _tool_error(f"Connection check failed: {e!s}")
 
 
 @mcp.tool()
@@ -43,13 +186,16 @@ async def list_tasks(
     project_name: str | None = None,
     status: str | None = None,
     tags: list[str] | None = None,
+    page: int = 0,
+    page_size: int | None = None,
 ) -> list[dict[str, Any]]:
-    """List ClearML tasks with filters."""
+    """List ClearML tasks with filters. Optional page and page_size use server side paging."""
     try:
+        task_filter = _merge_task_filter(status, page, page_size)
         # Task.query_tasks returns task IDs (strings), not task objects
         task_ids = Task.query_tasks(
             project_name=project_name,
-            task_filter={"status": [status]} if status else None,
+            task_filter=task_filter,
             tags=tags,
         )
 
@@ -88,24 +234,29 @@ async def get_task_parameters(task_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def get_task_metrics(task_id: str) -> dict[str, Any]:
-    """Get task training metrics and scalars."""
+async def get_task_metrics(
+    task_id: str,
+    *,
+    include_series: bool = False,
+    full_series: bool = False,
+    max_samples: int = 0,
+    x_axis: str = "iter",
+    max_points_per_series: int | None = None,
+) -> dict[str, Any]:
+    """Get task training metrics and scalars. Set include_series for x and y arrays."""
     try:
         task = Task.get_task(task_id=task_id)
-        scalars = task.get_reported_scalars()
-
-        metrics = {}
-        for metric, variants in scalars.items():
-            metrics[metric] = {}
-            for variant, data in variants.items():
-                if data and "y" in data:
-                    metrics[metric][variant] = {
-                        "last_value": data["y"][-1] if data["y"] else None,
-                        "min_value": min(data["y"]) if data["y"] else None,
-                        "max_value": max(data["y"]) if data["y"] else None,
-                        "iterations": len(data["y"]),
-                    }
-        return metrics
+        scalars = _load_reported_scalars(
+            task,
+            full_series=full_series,
+            max_samples=max_samples,
+            x_axis=x_axis,
+        )
+        return _metrics_from_scalars(
+            scalars,
+            include_series=include_series,
+            max_points_per_series=max_points_per_series,
+        )
     except Exception as e:
         return {"error": f"Failed to get task metrics: {e!s}"}
 
@@ -129,6 +280,48 @@ async def get_task_artifacts(task_id: str) -> dict[str, Any]:
         return artifact_dict
     except Exception as e:
         return {"error": f"Failed to get task artifacts: {e!s}"}
+
+
+@mcp.tool()
+async def get_task_code_provenance(task_id: str) -> dict[str, Any]:
+    """Get repository, branch, commit, entry script, and diff captured for this task."""
+    try:
+        task = Task.get_task(task_id=task_id)
+        script = getattr(task.data, "script", None) if task.data else None
+        payload = _script_to_dict(script)
+        return {"ok": True, "script": payload}
+    except Exception as e:
+        return _tool_error(f"Failed to get task code provenance: {e!s}")
+
+
+@mcp.tool()
+async def get_task_console_log(task_id: str, number_of_reports: int = 500) -> dict[str, Any]:
+    """Get recent console log lines reported for this task."""
+    try:
+        task = Task.get_task(task_id=task_id)
+        lines = task.get_reported_console_output(number_of_reports=number_of_reports)
+        return {"ok": True, "lines": list(lines)}
+    except Exception as e:
+        return _tool_error(f"Failed to get task console log: {e!s}")
+
+
+@mcp.tool()
+async def get_task_configuration(
+    task_id: str,
+    section_name: str,
+    *,
+    as_dict: bool = False,
+) -> dict[str, Any]:
+    """Get a named configuration section blob from the task (for example Hydra or JSON config)."""
+    try:
+        task = Task.get_task(task_id=task_id)
+        if as_dict:
+            parsed = task.get_configuration_object_as_dict(name=section_name)
+            return {"ok": True, "section_name": section_name, "value": parsed}
+        text = task.get_configuration_object(name=section_name)
+        return {"ok": True, "section_name": section_name, "value": text}
+    except Exception as e:
+        return _tool_error(f"Failed to get task configuration: {e!s}")
 
 
 @mcp.tool()
@@ -302,56 +495,72 @@ async def list_projects() -> list[dict[str, Any]]:
 async def get_project_stats(project_name: str) -> dict[str, Any]:
     """Get project statistics and task counts."""
     try:
-        tasks = Task.query_tasks(project_name=project_name)
+        task_ids = Task.query_tasks(project_name=project_name)
 
-        status_counts = {}
-        for task in tasks:
-            status = task.status
-            status_counts[status] = status_counts.get(status, 0) + 1
+        status_counts: dict[str, int] = {}
+        task_types: set[str] = set()
+        for task_id in task_ids:
+            try:
+                task = Task.get_task(task_id=task_id)
+                st = task.status
+                status_counts[st] = status_counts.get(st, 0) + 1
+                tt = getattr(task, "task_type", None)
+                if tt:
+                    task_types.add(str(tt))
+            except Exception:
+                continue
 
         return {
             "project_name": project_name,
-            "total_tasks": len(tasks),
+            "total_tasks": len(task_ids),
             "status_breakdown": status_counts,
-            "task_types": list(set(task.type for task in tasks if hasattr(task, "type"))),
+            "task_types": sorted(task_types),
         }
     except Exception as e:
         return {"error": f"Failed to get project stats: {e!s}"}
 
 
 @mcp.tool()
-async def compare_tasks(task_ids: list[str], metrics: list[str] | None = None) -> dict[str, Any]:
+async def compare_tasks(
+    task_ids: list[str],
+    metrics: list[str] | None = None,
+    *,
+    include_series: bool = False,
+    full_series: bool = False,
+    max_samples: int = 0,
+    x_axis: str = "iter",
+    max_points_per_series: int | None = None,
+) -> dict[str, Any]:
     """Compare multiple tasks by metrics."""
     try:
         comparison = {}
 
         for task_id in task_ids:
             task = Task.get_task(task_id=task_id)
-            scalars = task.get_reported_scalars()
+            scalars = _load_reported_scalars(
+                task,
+                full_series=full_series,
+                max_samples=max_samples,
+                x_axis=x_axis,
+            )
 
-            task_metrics = {"name": task.name, "status": task.status, "metrics": {}}
+            task_metrics: dict[str, Any] = {"name": task.name, "status": task.status, "metrics": {}}
 
             if metrics:
                 for metric in metrics:
-                    if metric in scalars:
-                        task_metrics["metrics"][metric] = {}
-                        for variant, data in scalars[metric].items():
-                            if data and "y" in data and data["y"]:
-                                task_metrics["metrics"][metric][variant] = {
-                                    "last_value": data["y"][-1],
-                                    "min_value": min(data["y"]),
-                                    "max_value": max(data["y"]),
-                                }
+                    if metric not in scalars:
+                        continue
+                    task_metrics["metrics"][metric] = _metrics_from_scalars(
+                        {metric: scalars[metric]},
+                        include_series=include_series,
+                        max_points_per_series=max_points_per_series,
+                    ).get(metric, {})
             else:
-                for metric, variants in scalars.items():
-                    task_metrics["metrics"][metric] = {}
-                    for variant, data in variants.items():
-                        if data and "y" in data and data["y"]:
-                            task_metrics["metrics"][metric][variant] = {
-                                "last_value": data["y"][-1],
-                                "min_value": min(data["y"]),
-                                "max_value": max(data["y"]),
-                            }
+                task_metrics["metrics"] = _metrics_from_scalars(
+                    scalars,
+                    include_series=include_series,
+                    max_points_per_series=max_points_per_series,
+                )
 
             comparison[task_id] = task_metrics
 
@@ -361,8 +570,15 @@ async def compare_tasks(task_ids: list[str], metrics: list[str] | None = None) -
 
 
 @mcp.tool()
-async def search_tasks(query: str, project_name: str | None = None) -> list[dict[str, Any]]:
-    """Search tasks by name, tags, or description."""
+async def search_tasks(
+    query: str,
+    project_name: str | None = None,
+    page: int = 0,
+    page_size: int | None = None,
+) -> list[dict[str, Any]]:
+    """Search tasks by name, tags, or description.
+    Optional page and page_size slice the result list.
+    """
     try:
         # Task.query_tasks returns task IDs (strings), not task objects
         task_ids = Task.query_tasks(project_name=project_name)
@@ -400,6 +616,11 @@ async def search_tasks(query: str, project_name: str | None = None) -> list[dict
                 matching_tasks.append(
                     {"id": task_id, "error": f"Failed to get task details: {e!s}"}
                 )
+
+        if page_size is not None:
+            start = max(page, 0) * page_size
+            end = start + page_size
+            matching_tasks = matching_tasks[start:end]
 
         return matching_tasks
     except Exception as e:

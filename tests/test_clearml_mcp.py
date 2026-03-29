@@ -818,8 +818,7 @@ class TestProjectOperations:
     @patch("clearml_mcp.clearml_mcp.Task")
     async def test_calculates_project_statistics(self, mock_task):
         """get_project_stats returns project statistics correctly."""
-        # Arrange: Create mock tasks with different statuses
-        tasks = []
+        # Arrange: status list aligned with tid0..tid16
         statuses = [
             "created",
             "created",
@@ -840,13 +839,17 @@ class TestProjectOperations:
             "completed",
         ]
 
-        for i, status in enumerate(statuses):
-            task = Mock()
-            task.status = status
-            task.type = "training" if i % 2 == 0 else "inference"
-            tasks.append(task)
+        task_ids = [f"tid{i}" for i in range(17)]
 
-        mock_task.query_tasks.return_value = tasks
+        def mock_get_task(task_id: str) -> Mock:
+            idx = int(task_id.replace("tid", ""))
+            task = Mock()
+            task.status = statuses[idx]
+            task.task_type = "training" if idx % 2 == 0 else "inference"
+            return task
+
+        mock_task.query_tasks.return_value = task_ids
+        mock_task.get_task.side_effect = mock_get_task
 
         # Act
         result = await clearml_mcp.get_project_stats.fn("Test Project")
@@ -858,6 +861,8 @@ class TestProjectOperations:
         assert result["status_breakdown"]["in_progress"] == 3
         assert result["status_breakdown"]["completed"] == 4
         assert result["status_breakdown"]["failed"] == 2
+        assert "training" in result["task_types"]
+        assert "inference" in result["task_types"]
 
     @pytest.mark.asyncio
     @patch("clearml_mcp.clearml_mcp.Task")
@@ -1142,6 +1147,146 @@ class TestTaskSearch:
         assert result[0]["name"] == "Simple Task"
         assert result[0]["tags"] == []
         assert result[0]["comment"] == ""  # getattr returns "" for None comment
+
+
+class TestConnectionAndNewTools:
+    """Tests for connection info and extended task retrieval tools."""
+
+    @pytest.mark.asyncio
+    @patch("clearml_mcp.clearml_mcp.Task")
+    async def test_get_connection_info_success(self, mock_task):
+        """get_connection_info returns project count when API works."""
+        mock_task.get_projects.return_value = [Mock(), Mock()]
+
+        result = await clearml_mcp.get_connection_info.fn()
+
+        assert result["ok"] is True
+        assert result["accessible_project_count"] == 2
+
+    @pytest.mark.asyncio
+    @patch("clearml_mcp.clearml_mcp.Task")
+    async def test_get_connection_info_failure(self, mock_task):
+        """get_connection_info returns ok False on errors."""
+        mock_task.get_projects.side_effect = Exception("offline")
+
+        result = await clearml_mcp.get_connection_info.fn()
+
+        assert result["ok"] is False
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    @patch("clearml_mcp.clearml_mcp.Task")
+    async def test_get_task_code_provenance(self, mock_task):
+        """get_task_code_provenance returns script fields."""
+        script = Mock()
+        script.repository = "https://example.com/repo.git"
+        script.branch = "main"
+        script.version_num = "abc123"
+        script.entry_point = "train.py"
+        script.working_dir = "."
+        script.diff = None
+        script.binary = None
+        script.requirements = None
+
+        task = Mock()
+        task.data = Mock()
+        task.data.script = script
+        mock_task.get_task.return_value = task
+
+        result = await clearml_mcp.get_task_code_provenance.fn("t1")
+
+        assert result["ok"] is True
+        assert result["script"]["repository"] == "https://example.com/repo.git"
+        assert result["script"]["branch"] == "main"
+
+    @pytest.mark.asyncio
+    @patch("clearml_mcp.clearml_mcp.Task")
+    async def test_get_task_console_log(self, mock_task):
+        """get_task_console_log returns lines from ClearML."""
+        task = Mock()
+        task.get_reported_console_output.return_value = ["line1", "line2"]
+        mock_task.get_task.return_value = task
+
+        result = await clearml_mcp.get_task_console_log.fn("t1", number_of_reports=100)
+
+        assert result["ok"] is True
+        assert result["lines"] == ["line1", "line2"]
+        task.get_reported_console_output.assert_called_once_with(number_of_reports=100)
+
+    @pytest.mark.asyncio
+    @patch("clearml_mcp.clearml_mcp.Task")
+    async def test_get_task_configuration_as_text(self, mock_task):
+        """get_task_configuration returns text blob when as_dict is False."""
+        task = Mock()
+        task.get_configuration_object.return_value = '{"a": 1}'
+        mock_task.get_task.return_value = task
+
+        result = await clearml_mcp.get_task_configuration.fn("t1", "General", as_dict=False)
+
+        assert result["ok"] is True
+        assert result["section_name"] == "General"
+        assert result["value"] == '{"a": 1}'
+
+
+class TestPaginationAndSeries:
+    """Server side list paging and scalar series options."""
+
+    @pytest.mark.asyncio
+    @patch("clearml_mcp.clearml_mcp.Task")
+    async def test_list_tasks_passes_page_to_query(self, mock_task):
+        """list_tasks forwards page and page_size in task_filter."""
+        mock_task.query_tasks.return_value = []
+
+        await clearml_mcp.list_tasks.fn(page=2, page_size=10)
+
+        mock_task.query_tasks.assert_called_once()
+        call_kw = mock_task.query_tasks.call_args.kwargs
+        assert call_kw["task_filter"]["page"] == 2
+        assert call_kw["task_filter"]["page_size"] == 10
+        assert call_kw["task_filter"]["order_by"] == ["-last_update"]
+
+    @pytest.mark.asyncio
+    @patch("clearml_mcp.clearml_mcp.Task")
+    async def test_get_task_metrics_include_series(self, mock_task):
+        """get_task_metrics includes x and y when include_series is True."""
+        task = Mock()
+        task.get_reported_scalars.return_value = {
+            "loss": {"train": {"x": [1, 2], "y": [0.5, 0.4]}},
+        }
+        mock_task.get_task.return_value = task
+
+        result = await clearml_mcp.get_task_metrics.fn(
+            "t1", include_series=True, max_points_per_series=100
+        )
+
+        assert "loss" in result
+        assert result["loss"]["train"]["x"] == [1, 2]
+        assert result["loss"]["train"]["y"] == [0.5, 0.4]
+
+    @pytest.mark.asyncio
+    @patch("clearml_mcp.clearml_mcp.Task")
+    async def test_search_tasks_slices_results(self, mock_task):
+        """search_tasks applies page and page_size to matched rows."""
+        mock_task.query_tasks.return_value = ["a", "b", "c", "d"]
+
+        def mock_get_task(task_id):
+            task = Mock()
+            task.id = task_id
+            task.name = f"name_{task_id}"
+            task.status = "completed"
+            task.get_project_name.return_value = "P"
+            task.data.created = "2024-01-01"
+            task.data.tags = []
+            task.comment = ""
+            return task
+
+        mock_task.get_task.side_effect = mock_get_task
+
+        result = await clearml_mcp.search_tasks.fn("name", page=1, page_size=2)
+
+        assert len(result) == 2
+        assert result[0]["id"] == "c"
+        assert result[1]["id"] == "d"
 
 
 class TestMainEntryPoint:

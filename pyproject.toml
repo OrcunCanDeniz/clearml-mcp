@@ -160,6 +160,7 @@ ignore = [
     "C401", # unnecessary generator (specific instances)
     "PLR0913", # too many arguments (specific functions)
     "S110", # try-except-pass (legitimate for skipping inaccessible tasks)
+    "S112", # try-except-continue (skip unreadable tasks in stats)
 ]
 
 [tool.ty]
